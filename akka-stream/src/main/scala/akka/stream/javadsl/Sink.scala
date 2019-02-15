@@ -318,11 +318,11 @@ object Sink {
   def unfoldResource[T, S](
     create: function.Creator[S],
     write:  function.Procedure2[S, T],
-    close:  function.Procedure[S]): javadsl.Sink[T, NotUsed] =
+    close:  function.Procedure[S]): javadsl.Sink[T, CompletionStage[Done]] =
     new Sink(scaladsl.Sink.unfoldResource[T, S](
       create.create _,
       (s: S, t: T) ⇒ write.apply(s, t),
-      close.apply))
+      close.apply)).mapMaterializedValue(_.toJava)
 
   /**
    * Start a new `Sink` from some resource which can be opened, written to, and closed.
@@ -347,11 +347,11 @@ object Sink {
   def unfoldResourceAsync[T, S](
     create: function.Creator[CompletionStage[S]],
     write:  function.Function2[S, T, CompletionStage[Done]],
-    close:  function.Function[S, CompletionStage[Done]]): javadsl.Sink[T, NotUsed] =
+    close:  function.Function[S, CompletionStage[Done]]): javadsl.Sink[T, CompletionStage[Done]] =
     new Sink(scaladsl.Sink.unfoldResourceAsync[T, S](
       () ⇒ create.create().toScala,
       (s: S, t: T) ⇒ write.apply(s, t).toScala,
-      (s: S) ⇒ close.apply(s).toScala))
+      (s: S) ⇒ close.apply(s).toScala)).mapMaterializedValue(_.toJava)
 
   /**
    * Creates a real `Sink` upon receiving the first element. Internal `Sink` will not be created if there are no elements,

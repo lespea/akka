@@ -12,7 +12,7 @@ import akka.stream._
 import akka.stream.impl.Stages.DefaultAttributes
 import akka.stream.stage._
 
-import scala.concurrent.Future
+import scala.concurrent.{ Future, Promise }
 import scala.util.{ Failure, Success, Try }
 import scala.util.control.NonFatal
 
@@ -20,88 +20,100 @@ import scala.util.control.NonFatal
  * INTERNAL API
  */
 @InternalApi private[akka] final class UnfoldResourceSinkAsync[T, S](
-  create:   () ⇒ Future[S],
-  readData: (S, T) ⇒ Future[Done],
-  close:    (S) ⇒ Future[Done]) extends GraphStage[SinkShape[T]] {
-  val in = Inlet[T]("UnfoldResourceSinkAsync.out")
+  create: () ⇒ Future[S],
+  write:  (S, T) ⇒ Future[Done],
+  close:  (S) ⇒ Future[Done]) extends GraphStageWithMaterializedValue[SinkShape[T], Future[Done]] {
+  val in = Inlet[T]("UnfoldResourceSinkAsync.in")
   override val shape = SinkShape(in)
   override def initialAttributes: Attributes = DefaultAttributes.unfoldResourceSinkAsync
 
-  def createLogic(inheritedAttributes: Attributes) = new GraphStageLogic(shape) with InHandler {
-    lazy val decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
-    private implicit def ec = materializer.executionContext
-    private var blockingStream: Option[S] = None
+  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[Done]) = {
+    val promise = Promise[Done]()
 
-    private val createdCallback = getAsyncCallback[Try[S]] {
-      case Success(resource) ⇒
-        blockingStream = Some(resource)
-        pull(in)
-      case Failure(t) ⇒ failStage(t)
-    }.invokeWithFeedback _
+    val createLogic = new GraphStageLogic(shape) with InHandler {
+      lazy val decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
 
-    private val errorHandler: PartialFunction[Throwable, Unit] = {
-      case NonFatal(ex) ⇒ decider(ex) match {
-        case Supervision.Stop ⇒
-          failStage(ex)
-        case Supervision.Restart ⇒ restartResource()
-        case Supervision.Resume  ⇒ pull(in)
-      }
-    }
+      private implicit def ec = materializer.executionContext
 
-    private val pushCallback = getAsyncCallback[Try[Done]] {
-      case Success(_) ⇒ pull(in)
-      case Failure(t) ⇒ errorHandler(t)
-    }.invoke _
+      private var blockingStream: Option[S] = None
 
-    override def preStart(): Unit = createResource()
+      private val createdCallback = getAsyncCallback[Try[S]] {
+        case Success(resource) ⇒
+          blockingStream = Some(resource)
+          pull(in)
+        case Failure(t) ⇒ failStage(t)
+      }.invokeWithFeedback _
 
-    override def onPush(): Unit =
-      blockingStream match {
-        case Some(resource) ⇒
-          try {
-            readData(resource, grab(in)).onComplete(pushCallback)(sameThreadExecutionContext)
-          } catch errorHandler
-        case None ⇒
-        // we got a pull but there is no open resource, we are either
-        // currently creating/restarting then the pull will be triggered when creating the
-        // resource completes, or shutting down and then the push does not matter anyway
-      }
-
-    override def postStop(): Unit = {
-      blockingStream.foreach(close)
-    }
-
-    private def restartResource(): Unit = {
-      blockingStream match {
-        case Some(resource) ⇒
-          // wait for the resource to close before restarting
-          close(resource).onComplete(getAsyncCallback[Try[Done]] {
-            case Success(Done) ⇒
-              createResource()
-            case Failure(ex) ⇒ failStage(ex)
-          }.invoke)
-          blockingStream = None
-        case None ⇒
-          createResource()
-      }
-    }
-
-    private def createResource(): Unit = {
-      create().onComplete { resource ⇒
-        createdCallback(resource).recover {
-          case _: StreamDetachedException ⇒
-            // stream stopped
-            resource match {
-              case Success(r)  ⇒ close(r)
-              case Failure(ex) ⇒ throw ex // failed to open but stream is stopped already
-            }
+      private val errorHandler: PartialFunction[Throwable, Unit] = {
+        case NonFatal(ex) ⇒ decider(ex) match {
+          case Supervision.Stop ⇒
+            promise.tryFailure(ex)
+            failStage(ex)
+          case Supervision.Restart ⇒ restartResource()
+          case Supervision.Resume  ⇒ pull(in)
         }
       }
+
+      private val pushCallback = getAsyncCallback[Try[Done]] {
+        case Success(_) ⇒ pull(in)
+        case Failure(t) ⇒ errorHandler(t)
+      }.invoke _
+
+      override def preStart(): Unit = createResource()
+
+      override def onPush(): Unit =
+        blockingStream match {
+          case Some(resource) ⇒
+            try {
+              write(resource, grab(in)).onComplete(pushCallback)(sameThreadExecutionContext)
+            } catch errorHandler
+          case None ⇒
+          // we got a pull but there is no open resource, we are either
+          // currently creating/restarting then the pull will be triggered when creating the
+          // resource completes, or shutting down and then the push does not matter anyway
+        }
+
+      override def postStop(): Unit = {
+        promise.trySuccess(Done)
+        blockingStream.foreach(close)
+      }
+
+      private def restartResource(): Unit = {
+        blockingStream match {
+          case Some(resource) ⇒
+            // wait for the resource to close before restarting
+            close(resource).onComplete(getAsyncCallback[Try[Done]] {
+              case Success(Done) ⇒
+                createResource()
+              case Failure(ex) ⇒
+                promise.tryFailure(ex)
+                failStage(ex)
+            }.invoke)
+            blockingStream = None
+          case None ⇒
+            createResource()
+        }
+      }
+
+      private def createResource(): Unit = {
+        create().onComplete { resource ⇒
+          createdCallback(resource).recover {
+            case _: StreamDetachedException ⇒
+              // stream stopped
+              resource match {
+                case Success(r)  ⇒ close(r)
+                case Failure(ex) ⇒ throw ex // failed to open but stream is stopped already
+              }
+          }
+        }
+      }
+
+      setHandler(in, this)
     }
 
-    setHandler(in, this)
-
+    (createLogic, promise.future)
   }
+
   override def toString = "UnfoldResourceSinkAsync"
 
 }

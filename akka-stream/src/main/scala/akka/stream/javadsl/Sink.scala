@@ -320,7 +320,7 @@ object Sink {
     write:  function.Procedure2[S, T],
     close:  function.Procedure[S]): javadsl.Sink[T, NotUsed] =
     new Sink(scaladsl.Sink.unfoldResource[T, S](
-      create.create,
+      create.create _,
       (s: S, t: T) ⇒ write.apply(s, t),
       close.apply))
 

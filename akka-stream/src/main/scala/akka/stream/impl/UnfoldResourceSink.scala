@@ -23,19 +23,30 @@ import scala.util.control.NonFatal
   close:  (S) ⇒ Unit) extends GraphStageWithMaterializedValue[SinkShape[T], Future[Done]] {
   val in = Inlet[T]("UnfoldResourceSink.in")
   override val shape = SinkShape(in)
-  override def initialAttributes: Attributes = DefaultAttributes.unfoldResourceSource
+  override def initialAttributes: Attributes = DefaultAttributes.unfoldResourceSink
 
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[Done]) = {
     val done = Promise[Done]()
 
-    val createLogic = new GraphStageLogic(shape) with InHandler {
+    val createLogic = new GraphStageLogic(shape) with InHandler with StageLogging {
       lazy val decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
       var blockingStream = Option.empty[S]
       setHandler(in, this)
 
       override def preStart(): Unit = {
-        blockingStream = Some(create())
-        pull(in)
+        try {
+          blockingStream = Some(create())
+        } catch {
+          case NonFatal(ex) ⇒
+            done.tryFailure(ex)
+            throw ex
+        }
+
+        if (!isClosed(in)) {
+          pull(in)
+        } else {
+          closeStage()
+        }
       }
 
       final override def onPush(): Unit = {
@@ -45,8 +56,14 @@ import scala.util.control.NonFatal
           case NonFatal(ex) ⇒
             decider(ex) match {
               case Supervision.Stop ⇒
-                blockingStream.foreach(close)
+                val s = blockingStream
                 blockingStream = None
+                try {
+                  s.foreach(close)
+                } catch {
+                  case NonFatal(ex2) ⇒
+                    log.error("Error closing resource while handling error writing; throwing write error", ex2)
+                }
                 done.tryFailure(ex)
                 failStage(ex)
               case Supervision.Restart ⇒
@@ -54,21 +71,41 @@ import scala.util.control.NonFatal
               case Supervision.Resume ⇒
             }
         }
-        pull(in)
+        if (!isClosed(in)) {
+          pull(in)
+        } else {
+          closeStage()
+        }
       }
 
       override def onUpstreamFinish(): Unit = closeStage()
 
       private def restartState(): Unit = {
-        blockingStream.foreach(close)
+        val s = blockingStream
         blockingStream = None
-        blockingStream = Some(create())
+
+        try {
+          s.foreach(close)
+        } catch {
+          case NonFatal(ex) ⇒
+            done.tryFailure(ex)
+            failStage(ex)
+        }
+
+        try {
+          blockingStream = Some(create())
+        } catch {
+          case NonFatal(ex) ⇒
+            done.tryFailure(ex)
+            failStage(ex)
+        }
       }
 
       private def closeStage(): Unit =
         try {
-          blockingStream.foreach(close)
+          val s = blockingStream
           blockingStream = None
+          s.foreach(close)
           done.trySuccess(Done)
           completeStage()
         } catch {

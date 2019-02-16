@@ -37,7 +37,7 @@ class UnfoldResourceSinkSpec extends StreamSpec(UnboundedMailboxConfig) {
   private def tmpPath = Files.createTempFile(fs.getPath("/"), "tmp", ".txt")
   private def newBufferedWriter(path: Path) = Files.newBufferedWriter(path, StandardCharsets.UTF_8)
 
-  "Unfold Resource Source" must {
+  "Unfold Resource Sink" must {
     "write contents to a file" in assertAllStagesStopped {
       val path = tmpPath
       val closedCount = new LongAdder

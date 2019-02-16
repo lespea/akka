@@ -346,8 +346,8 @@ object Sink {
    */
   def unfoldResourceAsync[T, S](
     create: function.Creator[CompletionStage[S]],
-    write:  function.Function2[S, T, CompletionStage[Done]],
-    close:  function.Function[S, CompletionStage[Done]]): javadsl.Sink[T, CompletionStage[Done]] =
+    write:  function.Function2[S, T, CompletionStage[Unit]],
+    close:  function.Function[S, CompletionStage[Unit]]): javadsl.Sink[T, CompletionStage[Done]] =
     new Sink(scaladsl.Sink.unfoldResourceAsync[T, S](
       () ⇒ create.create().toScala,
       (s: S, t: T) ⇒ write.apply(s, t).toScala,

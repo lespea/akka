@@ -580,7 +580,7 @@ object Sink {
    *                is received. Stream calls close and completes when upstream closes.
    * @param close - function that closes resource
    */
-  def unfoldResourceAsync[T, S](create: () ⇒ Future[S], write: (S, T) ⇒ Future[Done], close: (S) ⇒ Future[Done]): Sink[T, Future[Done]] =
+  def unfoldResourceAsync[T, S](create: () ⇒ Future[S], write: (S, T) ⇒ Future[Unit], close: (S) ⇒ Future[Unit]): Sink[T, Future[Done]] =
     Sink.fromGraph(new UnfoldResourceSinkAsync(create, write, close))
 
   /**

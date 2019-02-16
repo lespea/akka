@@ -21,8 +21,8 @@ import scala.util.control.NonFatal
  */
 @InternalApi private[akka] final class UnfoldResourceSinkAsync[T, S](
   create: () ⇒ Future[S],
-  write:  (S, T) ⇒ Future[Done],
-  close:  (S) ⇒ Future[Done]) extends GraphStageWithMaterializedValue[SinkShape[T], Future[Done]] {
+  write:  (S, T) ⇒ Future[Unit],
+  close:  (S) ⇒ Future[Unit]) extends GraphStageWithMaterializedValue[SinkShape[T], Future[Done]] {
   val in = Inlet[T]("UnfoldResourceSinkAsync.in")
   override val shape = SinkShape(in)
   override def initialAttributes: Attributes = DefaultAttributes.unfoldResourceSinkAsync
@@ -40,7 +40,10 @@ import scala.util.control.NonFatal
       private val createdCallback = getAsyncCallback[Try[S]] {
         case Success(resource) ⇒
           blockingStream = Some(resource)
-          pull(in)
+
+          if (!isClosed(in)) {
+            pull(in)
+          }
         case Failure(t) ⇒ failStage(t)
       }.invokeWithFeedback _
 
@@ -54,7 +57,7 @@ import scala.util.control.NonFatal
         }
       }
 
-      private val pushCallback = getAsyncCallback[Try[Done]] {
+      private val pushCallback = getAsyncCallback[Try[Unit]] {
         case Success(_) ⇒ pull(in)
         case Failure(t) ⇒ errorHandler(t)
       }.invoke _
@@ -74,37 +77,65 @@ import scala.util.control.NonFatal
         }
 
       override def postStop(): Unit = {
-        promise.trySuccess(Done)
-        blockingStream.foreach(close)
+        val o = blockingStream
+        blockingStream = None
+        o match {
+          case Some(s) ⇒
+            try {
+              val f = close(s).map(_ ⇒ Done)
+              f.failed.foreach(failStage)
+              promise.tryCompleteWith(f)
+            } catch {
+              case NonFatal(ex) ⇒
+                promise.tryFailure(ex)
+                failStage(ex)
+            }
+          case None ⇒ promise.trySuccess(Done)
+        }
       }
 
       private def restartResource(): Unit = {
-        blockingStream match {
+        val o = blockingStream
+        blockingStream = None
+
+        o match {
           case Some(resource) ⇒
             // wait for the resource to close before restarting
-            close(resource).onComplete(getAsyncCallback[Try[Done]] {
-              case Success(Done) ⇒
-                createResource()
-              case Failure(ex) ⇒
+            try {
+              close(resource).onComplete(getAsyncCallback[Try[Unit]] {
+                case Success(_) ⇒
+                  createResource()
+                case Failure(ex) ⇒
+                  promise.tryFailure(ex)
+                  failStage(ex)
+
+              }.invoke)
+            } catch {
+              case NonFatal(ex) ⇒
                 promise.tryFailure(ex)
                 failStage(ex)
-            }.invoke)
-            blockingStream = None
-          case None ⇒
-            createResource()
+            }
+
+          case None ⇒ createResource()
         }
       }
 
       private def createResource(): Unit = {
-        create().onComplete { resource ⇒
-          createdCallback(resource).recover {
-            case _: StreamDetachedException ⇒
-              // stream stopped
-              resource match {
-                case Success(r)  ⇒ close(r)
-                case Failure(ex) ⇒ throw ex // failed to open but stream is stopped already
-              }
+        try {
+          create().onComplete { resource ⇒
+            createdCallback(resource).recover {
+              case _: StreamDetachedException ⇒
+                // stream stopped
+                resource match {
+                  case Success(r)  ⇒ close(r)
+                  case Failure(ex) ⇒ throw ex // failed to open but stream is stopped already
+                }
+            }
           }
+        } catch {
+          case NonFatal(ex) ⇒
+            promise.tryFailure(ex)
+            failStage(ex)
         }
       }
 
